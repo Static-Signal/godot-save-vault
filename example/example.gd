@@ -6,6 +6,8 @@ extends Node
 
 func _ready() -> void:
 	var vault := SaveVault.new("example-key-change-me")
+	vault.save_completed.connect(func(slot: int, success: bool) -> void: print("save_completed: slot %d, success %s" % [slot, success]))
+	vault.load_completed.connect(func(slot: int, data: Dictionary) -> void: print("load_completed: slot %d" % slot))
 
 	var data := {
 		"level": 3,

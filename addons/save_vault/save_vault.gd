@@ -4,11 +4,19 @@ extends RefCounted
 ## Encrypted, multi-slot save/load with optional Steam Cloud sync and a
 ## safe, non-blocking autosave - Steam Cloud when available, always an
 ## encrypted local copy too, whichever is genuinely newer wins on load.
+## JSON or binary (var_to_bytes/bytes_to_var) encoding, your choice.
 ##
 ## This is intentionally just the storage layer: you build a plain
 ## Dictionary from your own game state and hand it to save()/save_async(),
 ## and get a plain Dictionary back from load() to apply however you like.
 ## It has no idea what's inside your save data.
+##
+## save_game()/load_game() emit save_completed/load_completed if you'd
+## rather react to a signal than check a return value inline.
+##
+## Prefer configuring this from the Inspector instead of code? See
+## SaveVaultNode (save_vault_node.gd) - a thin Node wrapper exposing the
+## same settings as @export properties.
 ##
 ## Usage:
 ##   var vault := SaveVault.new("your-own-secret-key-here")
@@ -20,25 +28,42 @@ extends RefCounted
 ##   var vault := SaveVault.new("your-own-secret-key-here")
 
 const DEFAULT_SAVE_DIR := "user://saves/"
-const DEFAULT_SAVE_EXTENSION := ".json"
+const FORMAT_JSON := "json"
+const FORMAT_BINARY := "binary"
+
+## Fires after a synchronous save_game() (or write_save()) attempt, success
+## or not. save_async() never emits this - see its own comment on why.
+signal save_completed(slot: int, success: bool)
+## Fires after load_game() (or read_save()) returns, data empty or not.
+signal load_completed(slot: int, data: Dictionary)
 
 var encryption_key: String
 var save_dir: String
 var save_extension: String
+var save_format: String
 var steam_available: bool = false
 
 var _save_task_id: int = -1  # in-flight background write from save_async(), see there
 
-func _init(p_encryption_key: String, p_save_dir: String = DEFAULT_SAVE_DIR, p_save_extension: String = DEFAULT_SAVE_EXTENSION) -> void:
+func _init(p_encryption_key: String, p_save_dir: String = DEFAULT_SAVE_DIR, p_save_extension: String = "", p_save_format: String = FORMAT_JSON) -> void:
 	## p_encryption_key is yours to pick - it's what FileAccess.open_encrypted_with_pass()
 	## uses to encrypt/decrypt the local save file. It isn't a secret worth
 	## real security (anyone can find it in your exported game's script
 	## bytecode), it's just enough to keep a save file from being trivially
 	## readable/hand-editable in a text editor - the same threat model
 	## FileAccess's own encrypted-file API is designed for.
+	##
+	## p_save_format is FORMAT_JSON (default) or FORMAT_BINARY - binary uses
+	## var_to_bytes()/bytes_to_var() instead of JSON encode/decode, smaller
+	## and a bit faster, at the cost of not being human-inspectable even
+	## before encryption. Leave p_save_extension blank to get the matching
+	## default (".json" or ".save") for whichever format you picked.
 	encryption_key = p_encryption_key
 	save_dir = p_save_dir
+	save_format = p_save_format
 	save_extension = p_save_extension
+	if save_extension.is_empty():
+		save_extension = ".save" if save_format == FORMAT_BINARY else ".json"
 	_ensure_save_dir()
 	_init_steam()
 
@@ -92,21 +117,18 @@ func delete_save(slot: int) -> void:
 # ─── Write ───
 
 func write_save(slot: int, data: Dictionary, sync_cloud: bool = true) -> bool:
-	## Writes save data as JSON. Steam Cloud if available and sync_cloud is
-	## true, always local. steam.fileWrite() blocks the calling thread and
-	## its latency depends on network/Steam client state, not just disk
-	## speed - sync_cloud lets a periodic autosave skip it so a bad Cloud
-	## round-trip can't turn into a periodic hitch; an explicit save/quit
-	## should still sync. Unindented JSON - never read by a human anyway
-	## (it's encrypted immediately after), so pretty-printing would just
-	## make the file bigger for nothing (Steam Cloud has a per-file quota).
-	var json_string: String = JSON.stringify(data)
+	## Writes save data (JSON or binary, per save_format). Steam Cloud if
+	## available and sync_cloud is true, always local. steam.fileWrite()
+	## blocks the calling thread and its latency depends on network/Steam
+	## client state, not just disk speed - sync_cloud lets a periodic
+	## autosave skip it so a bad Cloud round-trip can't turn into a
+	## periodic hitch; an explicit save/quit should still sync.
+	var byte_data: PackedByteArray = _encode(data)
 	var success: bool = false
 
 	if steam_available and sync_cloud:
 		var steam: Object = Engine.get_singleton("Steam")
 		var filename: String = get_steam_filename(slot)
-		var byte_data: PackedByteArray = json_string.to_utf8_buffer()
 		success = steam.fileWrite(filename, byte_data)
 		if not success:
 			push_warning("[SaveVault] Steam Cloud save failed, falling back to local")
@@ -123,7 +145,7 @@ func write_save(slot: int, data: Dictionary, sync_cloud: bool = true) -> bool:
 	if not file:
 		push_error("[SaveVault] Failed to open local save file for writing: slot %d" % slot)
 		return success
-	file.store_string(json_string)
+	file.store_buffer(byte_data)
 	file.close()
 
 	return true
@@ -133,7 +155,7 @@ func _write_save_local_only(slot: int, data: Dictionary) -> void:
 	## Steam Cloud, split out so it can run on a worker thread. Safe as
 	## long as `data` is a plain-value snapshot with no live reference back
 	## into mutable game state - see save_async()'s own comment.
-	var json_string: String = JSON.stringify(data)
+	var byte_data: PackedByteArray = _encode(data)
 	var save_path: String = get_save_path(slot)
 	if FileAccess.file_exists(save_path):
 		DirAccess.copy_absolute(save_path, get_save_backup_path(slot))
@@ -141,8 +163,13 @@ func _write_save_local_only(slot: int, data: Dictionary) -> void:
 	if not file:
 		push_error("[SaveVault] Background autosave failed to open local save file for writing: slot %d" % slot)
 		return
-	file.store_string(json_string)
+	file.store_buffer(byte_data)
 	file.close()
+
+func _encode(data: Dictionary) -> PackedByteArray:
+	if save_format == FORMAT_BINARY:
+		return var_to_bytes(data)
+	return JSON.stringify(data).to_utf8_buffer()
 
 func save_async(slot: int, data: Dictionary) -> void:
 	## Non-blocking autosave: the encode+encrypt+disk-write step moves to a
@@ -196,8 +223,7 @@ func _read_cloud_save(slot: int) -> Dictionary:
 	var file_data: Dictionary = steam.fileRead(filename, steam.getFileSize(filename))
 	if not file_data.get("ret", false):
 		return {}
-	var json_string: String = file_data.get("buf", PackedByteArray()).get_string_from_utf8()
-	return _parse_save_json(json_string, slot)
+	return _decode(file_data.get("buf", PackedByteArray()), slot)
 
 func _read_local_save(slot: int) -> Dictionary:
 	if not FileAccess.file_exists(get_save_path(slot)):
@@ -205,13 +231,24 @@ func _read_local_save(slot: int) -> Dictionary:
 	var file: FileAccess = FileAccess.open_encrypted_with_pass(get_save_path(slot), FileAccess.READ, encryption_key)
 	if not file:
 		# Try unencrypted - lets you adopt this addon for a project that
-		# already had plain-JSON saves, or recover from a key change.
+		# already had plain saves, or recover from a key change.
 		file = FileAccess.open(get_save_path(slot), FileAccess.READ)
 		if not file:
 			return {}
-	var json_string: String = file.get_as_text()
+	var byte_data: PackedByteArray = file.get_buffer(file.get_length())
 	file.close()
-	return _parse_save_json(json_string, slot)
+	return _decode(byte_data, slot)
+
+func _decode(byte_data: PackedByteArray, slot: int) -> Dictionary:
+	if byte_data.is_empty():
+		return {}
+	if save_format == FORMAT_BINARY:
+		var value: Variant = bytes_to_var(byte_data)
+		if value is Dictionary:
+			return value
+		push_warning("[SaveVault] Failed to decode binary save for slot %d" % slot)
+		return {}
+	return _parse_save_json(byte_data.get_string_from_utf8(), slot)
 
 func _parse_save_json(json_string: String, slot: int) -> Dictionary:
 	if json_string.is_empty():
@@ -236,6 +273,7 @@ func save_game(slot: int, data: Dictionary, sync_cloud: bool = true) -> bool:
 	var result: bool = write_save(slot, data, sync_cloud)
 	if result:
 		print("[SaveVault] Saved slot %d" % slot)
+	save_completed.emit(slot, result)
 	return result
 
 func load_game(slot: int) -> Dictionary:
@@ -244,4 +282,5 @@ func load_game(slot: int) -> Dictionary:
 	var data: Dictionary = read_save(slot)
 	if data.is_empty():
 		push_warning("[SaveVault] No save data found for slot %d" % slot)
+	load_completed.emit(slot, data)
 	return data
